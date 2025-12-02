@@ -16,6 +16,19 @@ COPY golang/ .
 # -o 指定输出文件名和路径
 RUN CGO_ENABLED=0 GOOS=linux go build -a -installsuffix cgo -o /go_app_binary .
 
+# --- Stage 2: Node Builder (for React log viewer) ---
+FROM node:20-alpine AS builder-node
+
+WORKDIR /app
+
+# 复制 package.json 并安装依赖
+COPY log-viewer/package*.json ./
+RUN npm install
+
+# 复制源代码并构建
+COPY log-viewer/ .
+RUN npm run build
+
 
 # --- Stage 2: Final Image ---
 # 使用 Playwright 官方镜像，已包含所有浏览器依赖
@@ -31,6 +44,9 @@ RUN apt-get update && \
 
 # 从 Go 构建阶段复制编译好的二进制文件到最终镜像中
 COPY --from=builder-go /go_app_binary .
+
+# 从 Node 构建阶段复制编译好的前端文件到最终镜像中
+COPY --from=builder-node /app/dist ./log-viewer/dist
 
 # 复制 Python 项目的 requirements.txt 并安装依赖
 COPY camoufox-py/requirements.txt ./camoufox-py/requirements.txt
