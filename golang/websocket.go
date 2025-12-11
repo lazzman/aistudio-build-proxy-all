@@ -102,29 +102,20 @@ func readPump(uc *UserConnection) {
 				return // 发送失败，认为连接已断
 			}
 		case "http_response", "stream_start", "stream_chunk", "stream_end", "error":
-			// VERBOSE LOGGING: Log every message received from browser client
-			log.Printf("[WS RECEIVED] Type: %s, ID: %s, User: %s", msg.Type, msg.ID, uc.UserID)
-			if msg.Type == "http_response" || msg.Type == "error" {
-				if status, ok := msg.Payload["status"].(float64); ok {
-					log.Printf("[WS RECEIVED] Status code: %d", int(status))
-				}
-				if body, ok := msg.Payload["body"].(string); ok {
-					log.Printf("[WS RECEIVED] Body length: %d bytes", len(body))
-				}
-			}
+			// Concise logging - only essential info to stdout
+			// Full details are logged by the proxy handlers
 
 			// 路由响应到等待的HTTP Handler
 			if ch, ok := pendingRequests.Load(msg.ID); ok {
 				respChan := ch.(chan *WSMessage)
-				// 尝试发送，如果通道已满（不太可能，但为了安全），则记录日志
 				select {
 				case respChan <- &msg:
-					log.Printf("[WS RECEIVED] Successfully routed to pending request: %s", msg.ID)
+					// Successfully routed - no need for verbose logging
 				default:
 					log.Printf("Warning: Response channel full for request ID %s, dropping message type %s", msg.ID, msg.Type)
 				}
 			} else {
-				log.Printf("Received response for unknown or timed-out request ID: %s", msg.ID)
+				log.Printf("Warning: Received response for unknown/timed-out request ID: %s", msg.ID)
 			}
 		default:
 			log.Printf("Received unknown message type from client: %s", msg.Type)

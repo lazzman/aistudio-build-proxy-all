@@ -55,13 +55,6 @@ func handleProxyRequest(w http.ResponseWriter, r *http.Request) {
 	// Fix systemInstruction role field (should not have role: "user")
 	bodyBytes = fixSystemInstruction(bodyBytes)
 
-	// VERBOSE: Log the request body being sent to Gemini (first 5000 chars)
-	bodyPreview := string(bodyBytes)
-	if len(bodyPreview) > 5000 {
-		bodyPreview = bodyPreview[:5000] + "... [truncated]"
-	}
-	log.Printf("[REQUEST BODY] %s", bodyPreview)
-
 	// 注意：将Header直接序列化为JSON可能需要一些处理，这里简化处理
 	// 对于生产环境，可能需要更精细的Header转换
 	headers := make(map[string][]string)
@@ -84,10 +77,9 @@ func handleProxyRequest(w http.ResponseWriter, r *http.Request) {
 		},
 	}
 
-	// VERBOSE LOGGING: Log the full request details
-	logMsg := fmt.Sprintf("[REQUEST %s] %s %s", reqID, r.Method, r.URL.String())
-	log.Println(logMsg)
-	addLog("INFO", logMsg, map[string]interface{}{
+	// Concise stdout logging, full details in web UI
+	log.Printf("[REQUEST %s] %s %s (%d bytes)", reqID, r.Method, r.URL.String(), len(bodyBytes))
+	addLog("INFO", fmt.Sprintf("[REQUEST %s] %s %s", reqID, r.Method, r.URL.String()), map[string]interface{}{
 		"request_id": reqID,
 		"method":     r.Method,
 		"url":        r.URL.String(),
@@ -127,6 +119,9 @@ func processWebSocketResponse(w http.ResponseWriter, r *http.Request, respChan c
 	}
 
 	headersSet := false
+	var errorBodyChunks []string
+	var errorStatusCode int
+	var errorRequestID string
 
 	for {
 		select {
@@ -160,10 +155,14 @@ func processWebSocketResponse(w http.ResponseWriter, r *http.Request, respChan c
 					statusCode = int(status)
 				}
 
-				// VERBOSE LOGGING: Log complete response
-				respMsg := fmt.Sprintf("[RESPONSE %s] Status: %d", reqID, statusCode)
-				log.Println(respMsg)
-				addLog("INFO", respMsg, map[string]interface{}{
+				bodyLen := 0
+				if body, ok := msg.Payload["body"].(string); ok {
+					bodyLen = len(body)
+				}
+
+				// Concise stdout logging, full details in web UI
+				log.Printf("[RESPONSE %s] Status: %d (%d bytes)", reqID, statusCode, bodyLen)
+				addLog("INFO", fmt.Sprintf("[RESPONSE %s] Status: %d", reqID, statusCode), map[string]interface{}{
 					"request_id": reqID,
 					"status":     statusCode,
 					"headers":    msg.Payload["headers"],
@@ -181,7 +180,33 @@ func processWebSocketResponse(w http.ResponseWriter, r *http.Request, respChan c
 					log.Println("Received stream_start after headers were already set. Ignoring.")
 					continue
 				}
-				log.Printf("[STREAM_START] Status: %v", msg.Payload["status"])
+
+				// Extract request ID and status
+				reqID := ""
+				if id, ok := msg.Payload["request_id"].(string); ok {
+					reqID = id
+				} else {
+					reqID = msg.ID
+				}
+				statusCode := 0
+				if status, ok := msg.Payload["status"].(float64); ok {
+					statusCode = int(status)
+				}
+
+				log.Printf("[STREAM] Starting (Status: %v)", msg.Payload["status"])
+
+				// Log error status codes to structured logs for debugging
+				if statusCode >= 400 {
+					errorStatusCode = statusCode
+					errorRequestID = reqID
+					errorBodyChunks = []string{}
+					addLog("WARN", fmt.Sprintf("[STREAM ERROR %s] Status: %d - Waiting for error body in chunks", reqID, statusCode), map[string]interface{}{
+						"request_id": reqID,
+						"status":     statusCode,
+						"headers":    msg.Payload["headers"],
+					})
+				}
+
 				setResponseHeaders(w, msg.Payload)
 				writeStatusCode(w, msg.Payload)
 				headersSet = true
@@ -190,29 +215,47 @@ func processWebSocketResponse(w http.ResponseWriter, r *http.Request, respChan c
 				}
 
 			case "stream_chunk":
-				// 流数据块
+				// 流数据块 - no stdout logging for chunks to reduce noise
 				if !headersSet {
-					// 如果还没收到stream_start，先设置默认头
 					log.Println("Warning: Received stream_chunk before stream_start. Using default 200 OK.")
 					w.WriteHeader(http.StatusOK)
 					headersSet = true
 				}
-				if data, ok := msg.Payload["data"].(string); ok && len(data) > 0 {
-					log.Printf("[STREAM_CHUNK] Data: %s", data)
+
+				// If this is an error response, accumulate chunks for logging
+				if errorStatusCode >= 400 {
+					if data, ok := msg.Payload["data"].(string); ok {
+						errorBodyChunks = append(errorBodyChunks, data)
+					}
 				}
+
 				writeBody(w, msg.Payload)
 				if flusher != nil {
-					flusher.Flush() // 立即将数据块发送给客户端
+					flusher.Flush()
 				}
 
 			case "stream_end":
 				// 流结束
 				if !headersSet {
-					// 如果流结束了但还没设置头，设置一个默认的
 					w.WriteHeader(http.StatusOK)
 				}
-				log.Printf("[STREAM_END] Stream completed")
-				return // 请求结束
+
+				// If this was an error response, log the complete error body
+				if errorStatusCode >= 400 && len(errorBodyChunks) > 0 {
+					fullErrorBody := ""
+					for _, chunk := range errorBodyChunks {
+						fullErrorBody += chunk
+					}
+					addLog("ERROR", fmt.Sprintf("[STREAM ERROR %s] Complete error response from Gemini API", errorRequestID), map[string]interface{}{
+						"request_id":  errorRequestID,
+						"status":      errorStatusCode,
+						"error_body":  fullErrorBody,
+					})
+					log.Printf("[STREAM ERROR] %s - Status %d - Body: %s", errorRequestID, errorStatusCode, fullErrorBody)
+				}
+
+				log.Println("[STREAM] Completed")
+				return
 
 			case "error":
 				// 前端返回错误
@@ -234,10 +277,9 @@ func processWebSocketResponse(w http.ResponseWriter, r *http.Request, respChan c
 						statusCode = int(code)
 					}
 
-					// VERBOSE ERROR LOGGING: Log complete error details
-					errLogMsg := fmt.Sprintf("[ERROR %s] Status: %d", reqID, statusCode)
-					log.Println(errLogMsg)
-					addLog("ERROR", errLogMsg, map[string]interface{}{
+					// Concise stdout logging, full details in web UI
+					log.Printf("[ERROR %s] Status: %d - %s", reqID, statusCode, errMsg)
+					addLog("ERROR", fmt.Sprintf("[ERROR %s] Status: %d", reqID, statusCode), map[string]interface{}{
 						"request_id": reqID,
 						"status":     statusCode,
 						"error":      errMsg,
