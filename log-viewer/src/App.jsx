@@ -20,7 +20,7 @@ import {
 } from "lucide-react";
 import "./App.css";
 
-const API_BASE = "http://localhost:5345";
+const API_BASE = "";
 
 function App() {
   const [logs, setLogs] = useState([]);
